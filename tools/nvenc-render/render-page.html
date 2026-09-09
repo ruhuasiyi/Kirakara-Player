@@ -1,0 +1,124 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<style>html,body{margin:0;padding:0;background:#000}</style>
+</head>
+<body>
+<canvas id="c" width="1280" height="720"></canvas>
+
+<!-- 依赖加载顺序与 index.html 保持一致（title 先于 config） -->
+<script src="../../js/shared/title.js"></script>
+<script src="../../js/shared/config.js"></script>
+<script src="../../js/shared/measure.js"></script>
+<script src="../../js/shared/progress.js"></script>
+<script src="../../js/parser.js"></script>
+<script src="../../js/canvas-renderer.js"></script>
+
+<script>
+  // ==================== 离屏渲染状态（供 Node 通过 page.evaluate 驱动） ====================
+  window.__state = {
+    lyrics: null,
+    config: null,
+    entryBuf: 2.0,
+    w: 1280,
+    h: 720,
+    bgImage: null,      // HTMLImageElement | null
+    bgCanvas: null,     // 预缩放后的背景 canvas（避免每帧缩放原图）
+    bgImageOpacity: 1,
+    imageFormat: 'jpeg', // 'jpeg' | 'png'（jpeg 编码快得多，最终 HEVC 本就有损）
+  };
+
+  // 初始化：lrcRaw 歌词原文，config 覆盖项（含 fontFamily），可选背景图 data URL
+  window.__init = function (opts) {
+    opts = opts || {};
+    const cfg = normalizeConfig(opts.config || {});
+    window.__state.config = cfg;
+    window.__state.entryBuf = getEntryBuf(cfg);
+    window.__state.w = opts.w || 1280;
+    window.__state.h = opts.h || 720;
+    window.__state.bgImageOpacity = (opts.bgImageOpacity != null) ? opts.bgImageOpacity : (cfg.bgImageOpacity != null ? cfg.bgImageOpacity : 1);
+    if (opts.imageFormat === 'png' || opts.imageFormat === 'jpeg') window.__state.imageFormat = opts.imageFormat;
+    window.__state.lyrics = parseLyrics(opts.lrcRaw || '', window.__state.entryBuf, cfg);
+
+    const c = document.getElementById('c');
+    c.width = window.__state.w;
+    c.height = window.__state.h;
+
+    // 背景图（data URL 加载，避开 file:// 限制）
+    window.__state.bgImage = null;
+    if (opts.bgImageDataUrl) {
+      const img = new Image();
+      img.src = opts.bgImageDataUrl;
+      window.__state.bgImage = img;  // drawImage 会在 loaded 后生效；首帧前需等 load
+    }
+    return { lyricCount: window.__state.lyrics.length, hasDualRuby: !!window._hasDualRuby };
+  };
+
+  // 构建最终背景缓存，只做一次。复刻网页 (index.html) 的双层背景：
+  //   1) 模糊暗化层：cover 填满 + blur(20px) brightness(0.4)
+  //   2) 前景层：contain 完整居中 + opacity
+  window.__buildBgCache = function () {
+    const s = window.__state;
+    if (s.bgCanvas) return true;
+    // 有背景图但尚未加载完 → 等下一轮
+    if (s.bgImage && !(s.bgImage.complete && s.bgImage.naturalWidth > 0)) return false;
+    const c = document.createElement('canvas');
+    c.width = s.w; c.height = s.h;
+    const cc = c.getContext('2d');
+    cc.fillStyle = s.config.bgColor || '#000';
+    cc.fillRect(0, 0, s.w, s.h);
+    if (s.bgImage) {
+      const iw = s.bgImage.naturalWidth, ih = s.bgImage.naturalHeight;
+      // 1) 模糊暗化层（cover 填满 + 外扩 40px，避免 blur 半透明边缘透出 bgColor 发绿）
+      cc.save();
+      cc.filter = 'blur(20px) brightness(0.4)';
+      const bs = Math.max(s.w / iw, s.h / ih);
+      const M = 40;  // 外扩 margin（> blur 半径 20px）
+      cc.drawImage(s.bgImage, (s.w - (iw * bs + M * 2)) / 2, (s.h - (ih * bs + M * 2)) / 2, iw * bs + M * 2, ih * bs + M * 2);
+      cc.restore();
+      // 2) 前景层（contain 居中 + 透明度）
+      cc.save();
+      cc.globalAlpha = s.bgImageOpacity;
+      const ss = Math.min(s.w / iw, s.h / ih);
+      cc.drawImage(s.bgImage, (s.w - iw * ss) / 2, (s.h - ih * ss) / 2, iw * ss, ih * ss);
+      cc.restore();
+    }
+    s.bgCanvas = c;
+    return true;
+  };
+
+  // 等待背景就绪
+  window.__ready = function () {
+    return window.__buildBgCache();
+  };
+
+  // 画一帧，返回 PNG data URL
+  window.__renderFrame = function (t) {
+    const s = window.__state;
+    const c = document.getElementById('c');
+    const ctx = c.getContext('2d');
+
+    ctx.clearRect(0, 0, s.w, s.h);
+
+    // ---- 背景（已预合成的缓存，每帧仅一次 drawImage） ----
+    if (s.bgCanvas) {
+      ctx.drawImage(s.bgCanvas, 0, 0);
+    } else {
+      ctx.fillStyle = s.config.bgColor || '#000';
+      ctx.fillRect(0, 0, s.w, s.h);
+    }
+
+    // ---- 歌词（1280x720 逻辑坐标系） ----
+    ctx.save();
+    ctx.scale(s.w / 1280, s.h / 720);
+    drawSongTitleOnCanvas(ctx, t, s.config);
+    drawLyricsOnCanvas(ctx, s.lyrics, t, s.config, s.entryBuf);
+    ctx.restore();
+
+    if (s.imageFormat === 'png') return c.toDataURL('image/png');
+    return c.toDataURL('image/jpeg', 0.95);
+  };
+</script>
+</body>
+</html>
