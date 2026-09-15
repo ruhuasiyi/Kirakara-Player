@@ -15,7 +15,7 @@ const http = require('http');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
-const { spawn } = require('child_process');
+const { spawn, execSync } = require('child_process');
 
 const PORT = Number(process.env.PORT || 8765);
 const ROOT = path.resolve(__dirname, '..', '..');   // 项目根
@@ -60,6 +60,28 @@ function sanitizeExt(ext) {
   return clean.startsWith('.') ? clean : '.' + clean;
 }
 
+// 读取音频编码格式（用于判断能否直通到目标容器）
+function probeAudioCodec(file) {
+  try {
+    const out = execSync(
+      `ffprobe -v error -select_streams a:0 -show_entries stream=codec_name -of default=noprint_wrappers=1:nokey=1 ${JSON.stringify(file)}`,
+      { encoding: 'utf8' }
+    );
+    return out.trim();
+  } catch (_) { return ''; }
+}
+
+// MP4 容器可承载的音频编码（超出此列表则直通会写出不兼容文件）
+const MP4_AUDIO_OK = ['aac', 'mp3', 'ac3', 'eac3', 'alac', 'flac'];
+
+// 追加一行运行日志（供前端实时查看）
+const MAX_LOGS = 1000;
+function pushLog(job, line) {
+  job.logs.push({ seq: job.logSeq, line });
+  job.logSeq++;
+  if (job.logs.length > MAX_LOGS) job.logs.splice(0, job.logs.length - MAX_LOGS);
+}
+
 // 静态文件服务（serve 项目根，路径穿越防护）
 function serveStatic(req, res, urlPath) {
   let rel = decodeURIComponent(urlPath.split('?')[0]);
@@ -80,6 +102,15 @@ function serveStatic(req, res, urlPath) {
 function startFfmpeg(job) {
   const m = job.meta;
   const W = m.w || 1920, H = m.h || 1080, fps = m.fps || 60;
+
+  // 音频直通预检：源编码必须能被 MP4 容器承载，否则写出的是不兼容文件
+  if (job.audioFile && m.audioCopy) {
+    const codec = probeAudioCodec(job.audioFile);
+    if (!codec || !MP4_AUDIO_OK.includes(codec)) {
+      pushLog(job, `音频直通不可用：源编码 ${codec || '未知'} 与 MP4 容器不兼容，已回退到 AAC 192k`);
+      m.audioCopy = false;
+    }
+  }
   const color = String(m.bgColor || '#000000').replace('#', '0x');
   const ffArgs = ['-y'];
 
@@ -104,7 +135,16 @@ function startFfmpeg(job) {
     ? `[1:v]fps=${fps},scale=${W}:${H}:force_original_aspect_ratio=decrease,pad=${W}:${H}:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1[bg]`
     : `[1:v]scale=${W}:${H},setsar=1,fps=${fps}[bg]`;
   ffArgs.push('-filter_complex', `${bgFilter};[bg][0:v]overlay=0:0:format=auto,format=yuv420p[v]`, '-map', '[v]');
-  if (audioIdx >= 0) ffArgs.push('-map', `${audioIdx}:a:0`, '-c:a', 'aac', '-b:a', '192k');
+
+  // 音频：直通（不重编码）或 AAC
+  if (audioIdx >= 0) {
+    ffArgs.push('-map', `${audioIdx}:a:0`);
+    if (m.audioCopy) {
+      ffArgs.push('-c:a', 'copy');
+    } else {
+      ffArgs.push('-c:a', 'aac', '-b:a', '192k');
+    }
+  }
 
   ffArgs.push(
     '-c:v', m.codec || 'hevc_nvenc',
@@ -115,10 +155,24 @@ function startFfmpeg(job) {
     '-movflags', '+faststart',
     job.outPath,
   );
-  console.log(`[job ${job.id}] 启动 ${m.codec} 编码 bg=${job.bgKind || 'color'} audio=${!!job.audioFile}`);
-  const ff = spawn('ffmpeg', ['-hide_banner', '-loglevel', 'warning', ...ffArgs], { stdio: ['pipe', 'inherit', 'inherit'] });
+  const audioLabel = audioIdx < 0 ? '无' : (m.audioCopy ? '直通(copy)' : 'AAC 192k');
+  pushLog(job, `启动编码：${m.codec || 'hevc_nvenc'}  背景=${job.bgKind || '纯色'}  音频=${audioLabel}`);
+  console.log(`[job ${job.id}] 启动 ${m.codec} 编码 bg=${job.bgKind || 'color'} audio=${audioLabel}`);
+  const ff = spawn('ffmpeg', ['-hide_banner', '-loglevel', 'warning', '-stats', ...ffArgs], { stdio: ['pipe', 'pipe', 'pipe'] });
   job.ff = ff;
   ff.stdin.on('error', () => {});  // 浏览器端中断时 stdin 写入失败，忽略
+
+  // 收集 ffmpeg 输出作为实时日志（-stats 的进度行以 \r 刷新，按 \r 和 \n 一起分行）
+  let logBuf = '';
+  const drain = (chunk) => {
+    logBuf += chunk.toString();
+    const parts = logBuf.split(/[\r\n]/);
+    logBuf = parts.pop();
+    for (const line of parts) { const s = line.trim(); if (s) pushLog(job, s); }
+  };
+  ff.stderr.on('data', drain);
+  ff.stdout.on('data', drain);
+  ff.on('close', (code) => { if (logBuf.trim()) pushLog(job, logBuf.trim()); pushLog(job, `ffmpeg 退出，代码 ${code}`); });
   return ff;
 }
 
@@ -159,6 +213,7 @@ function handleApi(req, res, urlPath) {
         id, meta, tmpDir,
         audioFile: null,
         bgFile: null, bgKind: null,
+        logs: [], logSeq: 0,
         createdAt: Date.now(),
         state: 'uploading',
         outPath: path.join(tmpDir, 'out.mp4'),
@@ -207,6 +262,12 @@ function handleApi(req, res, urlPath) {
     }
     if (req.method === 'GET' && action === 'status') {
       return json(res, 200, { state: job.state, error: job.err });
+    }
+    // GET log?since=N：增量获取运行日志（前端实时显示）
+    if (req.method === 'GET' && action === 'log') {
+      const since = Number(new URL(urlPath, 'http://localhost').searchParams.get('since') || 0);
+      const lines = job.logs.filter(e => e.seq >= since).map(e => e.line);
+      return json(res, 200, { lines, next: job.logSeq });
     }
     if (req.method === 'GET' && action === 'download') {
       if (!fs.existsSync(job.outPath)) return json(res, 404, { error: 'no output yet' });
