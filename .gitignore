@@ -6,3 +6,9 @@ Rhythmicalyrics/
 images/5**.png
 images/4**.png
 .workbuddy/
+
+# 依赖
+node_modules/
+
+# NVENC 渲染的临时产物（帧序列、job 输出）
+.cache/

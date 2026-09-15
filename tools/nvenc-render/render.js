@@ -23,6 +23,7 @@ const CHROMIUM = process.env.CHROMIUM || '/usr/bin/chromium';
 
 function parseArgs() {
   const a = process.argv.slice(2);
+  if (a.includes('--help') || a.includes('-h')) { printHelp(); process.exit(0); }
   const get = (name, def) => {
     const i = a.indexOf(name);
     return (i >= 0 && a[i + 1] != null) ? a[i + 1] : def;
@@ -61,6 +62,44 @@ function framesBaseDir() {
   const d = path.join(os.homedir(), '.cache', 'kirakara-nvenc');
   fs.mkdirSync(d, { recursive: true });
   return d;
+}
+
+function printHelp() {
+  console.log(`
+Kirakara NVENC 离线渲染（命令行）
+
+用法：
+  pnpm render --krl <工程文件> --audio <音频> [选项]
+  node render.js --krl <工程文件> --audio <音频> [选项]
+
+必填：
+  --krl <path>              歌词/工程文件。传网页「导出工程」生成的 project.krl
+                            可读出完整配置（字体/颜色/背景），纯歌词 .krl 亦可
+  --audio <path>            音轨（flac/wav/mp3/m4a…），缺省时需给 --video
+
+背景：
+  --bg <path>               静态背景图（模糊暗化层 + 前景居中，与网页一致）
+  --video <path>            视频背景（ffmpeg 顺序读取，不做逐帧 seek）
+  --bgImageOpacity <0-1>    静态背景前景层不透明度（默认 1）
+  --bgColor <#rrggbb>       背景色 / 无背景图时的纯色底
+
+输出：
+  --out <path>              输出文件（默认 ./out.mp4）
+  --width / --height        分辨率（默认 1280 / 720）
+  --fps <n>                 帧率（默认 30）
+  --codec <name>            hevc_nvenc | h264_nvenc | av1_nvenc（默认 hevc_nvenc）
+  --preset <p1-p7>          NVENC 预设，越大越慢质量越好（默认 p5）
+  --cq <n>                  恒定质量，越小画质越好（默认 20）
+  --image-format <fmt>      中间帧格式 jpeg | png（默认 jpeg）
+
+其它：
+  --font <name>             覆盖工程里的字体
+  --start <sec>             起始时间（默认 0）
+  --duration <sec>          渲染时长（默认取音频全长）
+  --json-progress           以 JSON 行输出进度（供 server.js 解析）
+  --keep-frames             保留中间帧序列（调试用）
+  -h, --help                显示本帮助
+`);
 }
 
 function mkTmpDir() {

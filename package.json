@@ -1,0 +1,24 @@
+{
+  "name": "kirakara-player",
+  "version": "1.0.0",
+  "private": true,
+  "description": "基于浏览器的卡拉OK歌词播放器与视频导出工具",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/FMPeach/Kirakara-Player.git"
+  },
+  "packageManager": "pnpm@11.26.0",
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "start": "node tools/nvenc-render/server.js",
+    "dev": "node tools/nvenc-render/server.js",
+    "render": "node tools/nvenc-render/render.js",
+    "render:help": "node tools/nvenc-render/render.js --help"
+  },
+  "devDependencies": {
+    "puppeteer-core": "^24.0.0"
+  }
+}

@@ -1,54 +1,55 @@
 # nvenc-render
 
-脱离浏览器、用 **NVENC 硬件编码** 渲染 Kirakara 歌词视频的离线工具。
+用 **FFmpeg NVENC 硬件编码**导出 Kirakara 歌词视频，绕开 Linux 版浏览器无 H.264/AAC 编码器、VP9 软件编码极慢的问题。
 
-核心思路：复用主应用的 `js/canvas-renderer.js`（保证与浏览器预览/导出一致），把逐帧渲染交给**无头 Chromium**，把编码交给 **FFmpeg NVENC**（`hevc_nvenc`/`h264_nvenc`/`av1_nvenc`）。绕开了 Linux 版浏览器无法编码 H.264/HEVC、以及 VP9 软件编码极慢的问题。
+两条路径共用同一个渲染核心 `js/canvas-renderer.js`，效果与网页预览一致。
 
 ## 依赖
 
-- Node.js（`npm install` 安装 `puppeteer-core`，**不下载浏览器**）
-- 系统 Chromium（默认 `/usr/bin/chromium`，可用环境变量 `CHROMIUM` 覆盖）
+- Node.js 18+
+- 依赖统一由**根目录** `package.json` + pnpm 管理（`pnpm install`，唯一依赖 `puppeteer-core`，不下载浏览器）
+- 系统 Chromium（CLI 路径用，默认 `/usr/bin/chromium`，可用环境变量 `CHROMIUM` 覆盖）
 - FFmpeg（需带 `--enable-nvenc`）
 
-## 用法
+## 路径一：网页内导出（推荐）
 
 ```bash
-node render.js \
-  --krl   "/path/to/project.krl" \
-  --audio "/path/to/xxx.flac" \
-  --bg    "/path/to/cover.jpg" \
-  --out   "/path/to/out.mp4"
+pnpm start          # 等价于 node tools/nvenc-render/server.js
 ```
 
-> `--krl` 优先传**网页导出的工程文件**（`project.krl`，含 `config {…}` 块），工具会读取其中的字体/颜色/背景色等完整配置，保证与网页预览一致。纯歌词 `.krl`/`.lrc` 也可用，但走默认配置。
+浏览器打开 `http://localhost:8765`，导出弹窗选「NVENC 硬件加速」。
 
-## 参数
+服务同时提供静态托管和渲染 API：
 
-| 参数 | 默认 | 说明 |
-|------|------|------|
-| `--krl` | 必填 | 歌词/工程文件（`.krl` 含 `{漢字\|假名}` 注音与逐字时间戳；`project.krl` 另含 `config` 块） |
-| `--audio` | 必填 | 音轨（flac/wav/mp3…，ffmpeg 直接编 AAC） |
-| `--bg` | 无 | 背景图（cover-fit 铺满） |
-| `--out` | `./out.mp4` | 输出路径 |
-| `--fps` | 30 | 帧率 |
-| `--width` / `--height` | 1280 / 720 | 分辨率 |
-| `--font` | 项目配置 | 字体（显式传才覆盖 project.krl 的 `fontFamily`） |
-| `--bgColor` | 项目配置 | 背景色（显式传才覆盖 project.krl 的 `bgColor`） |
-| `--bgImageOpacity` | 1 | 封面透明度（默认不透明覆盖 `bgColor`，不会露出发绿的底） |
-| `--codec` | `hevc_nvenc` | `hevc_nvenc` / `h264_nvenc` / `av1_nvenc` |
-| `--preset` / `--cq` | `p5` / `20` | NVENC 质量（`p1` 最快 → `p7` 最好；`cq` 越小画质越好） |
-| `--start` / `--duration` | 0 / 音频全长 | 渲染片段（验证用） |
-| `--image-format` | `jpeg` | 帧中间格式；`jpeg`（快）或 `png`（无损） |
-| `--keep-frames` | 关闭 | 保留帧序列用于调试 |
+1. 浏览器用 `js/canvas-renderer.js` 渲染**歌词层**（透明 PNG 带 alpha），不画背景
+2. 背景交给 ffmpeg：静态图由浏览器合成一张 PNG 上传、视频**原文件直传**、纯色用 `lavfi` 生成
+3. 帧流 pipe 给 ffmpeg，`overlay` 叠加背景后 NVENC 编码
 
-## 性能（实测 RTX 5060 Laptop）
+导出浮层内有实时日志（ffmpeg 进度、错误、音频直通回退提示等）。
 
-- 渲染（Chromium 逐帧 + JPEG 输出）：纯色 ~96 fps，封面图 ~52 fps
-- 编码（`hevc_nvenc`）：约 3.6x 实时（250s 全片约 1 分钟）
-- 一条完整 250s 全片（1280×720@30fps + AAC）约 3-4 分钟
+## 路径二：命令行批量渲染
 
-## 与浏览器方案的差异
+```bash
+pnpm render --krl project.krl --audio song.flac --bg cover.jpg --out out.mp4
+pnpm render:help      # 全部参数
+```
 
-- 渲染引擎一致（同一个 `drawLyricsOnCanvas`），歌词走字/双注音/双行效果与浏览器预览一致。
-- 背景已复刻网页双层效果：模糊暗化层（cover + `blur(20px) brightness(0.4)`）+ 前景层（contain + 透明度）。
-- 分角色立绘（`characterProfiles.image`）暂未接入。
+用 `puppeteer-core` 驱动系统 Chromium 逐帧渲染。`--krl` 优先传网页「导出工程」生成的 `project.krl`（含 `config {…}` 块，读出完整字体/颜色/背景配置），纯歌词 `.krl`/`.lrc` 也可用但走默认配置。
+
+## 性能（实测 RTX 5060 Laptop，1920×1080）
+
+| 场景 | 速度 |
+|---|---|
+| 视频背景 | ~61 fps |
+| 图片背景 | ~70 fps（无歌词）/ ~56 fps（有歌词） |
+
+改造前的两个瓶颈与对策：
+
+- **`canvas.toBlob` 被 vsync 节流到约 16ms/帧**，且与分辨率几乎无关 → 用 canvas 池并行编码绕开。池大小有最优值：1080p 下 4 最优，8 会因内存竞争退化到 25.7ms。
+- **浏览器逐帧 seek 视频平均 15.5ms/帧（随机 seek 48.7ms）** → 背景视频完全交给 ffmpeg 顺序读取，浏览器不碰视频。
+
+## 音频直通
+
+网页导出弹窗可选「音频直通」，用 `-c:a copy` 直接封装源音频，无二次损失。server 会在启动前用 ffprobe 预检源编码是否被 MP4 容器承载（aac/mp3/ac3/eac3/alac/flac），不兼容则自动回退到 AAC 并写入导出日志。
+
+注意 FLAC 等无损格式封装进 MP4 属 ffmpeg 扩展，本地播放器可读，部分平台/硬件播放器可能不识别。
