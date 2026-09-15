@@ -505,6 +505,7 @@
             const [expFps, setExpFps] = useState(60);
             const [expCodec, setExpCodec] = useState('h264');
             const [expFormat, setExpFormat] = useState('mp4');
+            const [expMode, setExpMode] = useState('browser');  // 'browser'（浏览器内）| 'nvenc'（本地硬件加速）
             const [expAudioBitrate, setExpAudioBitrate] = useState(192);
             const [expAudioSampleRate, setExpAudioSampleRate] = useState(48000);
             const [exporting, setExporting] = useState(false);
@@ -577,6 +578,147 @@
             }, [exporting, expW, expH, expFps, expCodec, expFormat, duration, videoUrl, bgImageEnabled, bgImageUrl,
                 titleBackgroundUrl, audioUrl, expAudioBitrate, expAudioSampleRate,
                 parsedData, config, entryBuf]);
+
+            // ---- NVENC 本地渲染导出（调用本地 server.js） ----
+            const doExportNvenc = useCallback(async () => {
+                if (exporting) return;
+                if (!duration || duration <= 0) { alert("请先加载媒体"); return; }
+                setExporting(true); setShowExportModal(false);
+                setExpProgress(0); setExpEta('连接本地服务...'); cancelRef.current = false;
+
+                const API = 'http://localhost:8765';
+                const mimeToExt = (mime) => ({
+                    'audio/flac':'.flac','audio/mpeg':'.mp3','audio/wav':'.wav','audio/x-wav':'.wav',
+                    'audio/mp4':'.m4a','audio/aac':'.aac','audio/ogg':'.ogg','audio/webm':'.webm',
+                    'video/mp4':'.mp4','video/webm':'.webm','video/quicktime':'.mov','video/x-matroska':'.mkv',
+                })[mime] || '';
+
+                let canvasPool = [];
+                try {
+                    // 1) 读取音频与背景（背景不在浏览器渲染，只把素材交给 ffmpeg 合成）
+                    let audioBuf = null, audioExt = '', videoBuf = null, videoExt = '.mp4';
+                    if (audioUrl) {
+                        const resp = await fetch(audioUrl);
+                        audioExt = mimeToExt(resp.headers.get('content-type') || '');
+                        audioBuf = await resp.arrayBuffer();
+                    }
+                    const bgKind = videoUrl ? 'video' : ((bgImageEnabled && bgImageUrl) ? 'image' : 'none');
+                    if (bgKind === 'video') {
+                        const resp = await fetch(videoUrl);
+                        videoExt = mimeToExt(resp.headers.get('content-type') || '') || '.mp4';
+                        videoBuf = await resp.arrayBuffer();
+                    }
+
+                    // 2) 建任务
+                    const totalFrames = Math.max(1, Math.ceil(duration * expFps));
+                    const meta = { fps: expFps, w: expW, h: expH, codec: expCodec, audioExt,
+                                   bgKind, videoExt, bgColor: config.bgColor || '#000000' };
+                    const r0 = await fetch(`${API}/api/render/stream`, { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(meta) });
+                    if (!r0.ok) throw new Error('本地服务不可用，请先运行 `node tools/nvenc-render/server.js`');
+                    const { jobId } = await r0.json();
+                    if (audioBuf) await fetch(`${API}/api/render/${jobId}/audio`, { method:'PUT', body: audioBuf });
+
+                    // 3) 准备渲染 canvas 池（并行编码，绕开 toBlob 的 vsync 节流）
+                    // 池大小实测：1080p 下 4 最优（8.5ms/帧），8 会因内存竞争反而退化到 25.7ms
+                    setExpEta('渲染准备...');
+                    const POOL = 4;
+                    const mkCanvas = () => {
+                        const c = document.createElement('canvas');
+                        c.width = expW; c.height = expH;
+                        // Firefox 对离屏 canvas 的 toBlob 会返回空 Blob，挂到 DOM（隐藏）规避
+                        c.style.position = 'fixed';
+                        c.style.left = '-9999px';
+                        c.style.top = '0';
+                        c.style.pointerEvents = 'none';
+                        document.body.appendChild(c);
+                        return c;
+                    };
+                    canvasPool = Array.from({ length: POOL }, mkCanvas);
+                    const ctxPool = canvasPool.map(c => c.getContext('2d', { willReadFrequently: true }));
+
+                    // 静态图背景：浏览器合成双层（模糊暗化 + 前景），作为一张 PNG 交给 ffmpeg
+                    if (bgKind === 'image') {
+                        const img = await new Promise((res) => { const im = new Image(); im.onload = () => res(im); im.onerror = () => res(null); im.src = bgImageUrl; });
+                        const bgc = mkCanvas();
+                        const bx = bgc.getContext('2d');
+                        bx.fillStyle = config.bgColor || '#000'; bx.fillRect(0, 0, expW, expH);
+                        if (img && img.naturalWidth > 0) {
+                            const iw = img.naturalWidth, ih = img.naturalHeight;
+                            bx.save(); bx.filter = 'blur(20px) brightness(0.4)';
+                            const bs = Math.max(expW / iw, expH / ih), M = 40;
+                            bx.drawImage(img, (expW - (iw * bs + M * 2)) / 2, (expH - (ih * bs + M * 2)) / 2, iw * bs + M * 2, ih * bs + M * 2);
+                            bx.restore();
+                            bx.save(); bx.globalAlpha = config.bgImageOpacity ?? 1;
+                            const ss = Math.min(expW / iw, expH / ih);
+                            bx.drawImage(img, (expW - iw * ss) / 2, (expH - ih * ss) / 2, iw * ss, ih * ss);
+                            bx.restore();
+                        }
+                        const bgBlob = await new Promise(res => bgc.toBlob(res, 'image/png'));
+                        await fetch(`${API}/api/render/${jobId}/bg`, { method:'PUT', body: bgBlob });
+                        bgc.remove();
+                    } else if (bgKind === 'video') {
+                        // 视频背景：原始文件直接交给 ffmpeg，浏览器不做逐帧 seek
+                        await fetch(`${API}/api/render/${jobId}/bg`, { method:'PUT', body: videoBuf });
+                    }
+
+                    // 4) 渲染一帧歌词层（透明背景，背景由 ffmpeg 叠加），返回 PNG Blob
+                    const renderFrameTo = async (slot, t) => {
+                        const x = ctxPool[slot];
+                        x.clearRect(0, 0, expW, expH);
+                        x.save();
+                        x.scale(expW / 1280, expH / 720);
+                        drawSongTitleOnCanvas(x, t, config);
+                        drawLyricsOnCanvas(x, parsedData, t, config, entryBuf);
+                        x.restore();
+                        return await new Promise(res => canvasPool[slot].toBlob(res, 'image/png'));
+                    };
+
+                    // 5) 并行渲染 + 分块发送（POOL 帧并行编码，每 1 秒发一批）
+                    setExpEta('渲染中...');
+                    const CHUNK = Math.max(POOL, Math.round(expFps));  // 1 秒一批
+                    let frameIndex = 0;
+                    const t0 = performance.now();
+                    for (let chunkStart = 0; chunkStart < totalFrames && !cancelRef.current; chunkStart += CHUNK) {
+                        const chunkEnd = Math.min(chunkStart + CHUNK, totalFrames);
+                        const parts = [];
+                        for (let b = chunkStart; b < chunkEnd; b += POOL) {
+                            const batchEnd = Math.min(b + POOL, chunkEnd);
+                            const batch = [];
+                            for (let i = b; i < batchEnd; i++) batch.push(renderFrameTo(i - b, i / expFps));
+                            parts.push(...await Promise.all(batch));
+                        }
+                        const chunkBlob = new Blob(parts, { type: 'image/png' });
+                        const rc = await fetch(`${API}/api/render/${jobId}/frames`, { method:'POST', body: chunkBlob });
+                        if (!rc.ok) { const e = await rc.json().catch(() => ({})); throw new Error(e.error || '上传帧失败'); }
+                        frameIndex = chunkEnd;
+                        setExpProgress(Math.round(frameIndex / totalFrames * 100));
+                        const el = (performance.now() - t0) / 1000;
+                        const fpsNow = frameIndex / el;
+                        setExpEta(`剩~${Math.max(0, Math.round((totalFrames - frameIndex) / fpsNow))}s`);
+                    }
+                    if (cancelRef.current) { setExporting(false); return; }
+                    // 结束帧流，等待编码完成
+                    const rFinish = await fetch(`${API}/api/render/${jobId}/finish`, { method:'POST' });
+                    if (!rFinish.ok) { const e = await rFinish.json().catch(() => ({})); throw new Error(e.error || '编码失败'); }
+
+                    // 6) 下载
+                    setExpEta('下载中...');
+                    const dl = await fetch(`${API}/api/render/${jobId}/download`);
+                    const blob = await dl.blob();
+                    const a = document.createElement('a');
+                    a.href = URL.createObjectURL(blob);
+                    a.download = 'kirakara-nvenc.mp4';
+                    document.body.appendChild(a); a.click();
+                    setTimeout(() => { document.body.removeChild(a); URL.revokeObjectURL(a.href); }, 3000);
+                    setExpProgress(100);
+                } catch (e) {
+                    alert('NVENC 导出失败：' + (e.message || e));
+                } finally {
+                    canvasPool.forEach(c => c.remove());
+                    canvasPool = [];
+                    setExporting(false);
+                }
+            }, [exporting, duration, expW, expH, expFps, expCodec, audioUrl, bgImageEnabled, bgImageUrl, videoUrl, config, parsedData, entryBuf]);
 
             // ---- 工程文件 (.krl) 导入/导出 ----
             const buildKrlConfig = useCallback(async (filterRoles) => {
@@ -1262,11 +1404,15 @@
                             <div className="export-modal"><h2>🎬 导出视频</h2>
                                 <div className="space-y-3" style={{marginTop:12}}>
                                     <div className="text-s text-zinc-400 font-semibold">视频设置</div>
-                                    {!aacOk && audioUrl && expFormat !== 'png-seq' && <div className="text-[10px] text-amber-400">当前浏览器不支持 AAC 音频编码，无法使用 MP4 格式导出</div>}
-                                    <div className="grid grid-cols-2 gap-3">
+                                    <div><label>编码方式</label><select value={expMode} onChange={e=>{const v=e.target.value;setExpMode(v);setExpFormat('mp4');setExpCodec(v==='nvenc'?'hevc_nvenc':'h264');}}><option value="browser">浏览器内</option><option value="nvenc">NVENC 硬件加速</option></select></div>
+                                    {!aacOk && audioUrl && expFormat !== 'png-seq' && expMode==='browser' && <div className="text-[10px] text-amber-400">当前浏览器不支持 AAC 音频编码，无法使用 MP4 格式导出</div>}
+                                    {expMode==='nvenc' ? <div className="grid grid-cols-2 gap-3">
+                                        <div><label>视频编码</label><select value={expCodec} onChange={e=>setExpCodec(e.target.value)}><option value="hevc_nvenc">H.265 (hevc_nvenc)</option><option value="h264_nvenc">H.264 (h264_nvenc)</option><option value="av1_nvenc">AV1 (av1_nvenc)</option></select></div>
+                                        <div><label>容器</label><input value="MP4" disabled/></div>
+                                    </div> : <div className="grid grid-cols-2 gap-3">
                                         <div><label>容器格式</label><select value={expFormat} onChange={e=>{setExpFormat(e.target.value);setExpCodec(e.target.value==='mp4'?'h264':'vp9');}}><option value="mp4" disabled={!aacOk && audioUrl}>MP4</option><option value="webm">WebM</option><option value="png-seq">MOV</option></select></div>
                                         <div><label>视频编码</label>{expFormat==='png-seq'?<select value="png" disabled><option value="png">透明背景PNG</option></select>:<select value={expCodec} onChange={e=>setExpCodec(e.target.value)}>{expFormat==='mp4'?<><option value="h264">H.264</option></>:<><option value="vp9">VP9</option><option value="vp8">VP8</option></>}</select>}</div>
-                                    </div>
+                                    </div>}
                                     <div className="grid grid-cols-2 gap-3">
                                         <div><label>分辨率</label><div className="flex items-center gap-1"><input type="number" value={expW} onChange={e=>{const r=e.target.value;setExpW(r===''?'':parseInt(r)||1920)}} onBlur={()=>{if(expW===''||expW<0)setExpW(1920)}} className="flex-1"/><span className="text-zinc-500">×</span><input type="number" value={expH} onChange={e=>{const r=e.target.value;setExpH(r===''?'':parseInt(r)||1080)}} onBlur={()=>{if(expH===''||expH<0)setExpH(1080)}} className="flex-1"/></div></div>
                                         <div><label>帧率 (FPS)</label><input type="number" value={expFps} onChange={e=>{const r=e.target.value;setExpFps(r===''?'':parseInt(r)||60)}} onBlur={()=>{if(expFps===''||expFps<0)setExpFps(60)}}/></div>
@@ -1278,7 +1424,7 @@
                                         <div><label>比特率</label><select value={expAudioBitrate} onChange={e=>setExpAudioBitrate(parseInt(e.target.value))}><option value={192}>192k</option><option value={128}>128k</option><option value={256}>256k</option></select></div>
                                     </div></>}
                                 </div>
-                                <div className="btn-row"><button className="btn btn-ghost" onClick={()=>setShowExportModal(false)}>取消</button><button className="btn btn-primary" onClick={doExport}>开始导出</button></div>
+                                <div className="btn-row"><button className="btn btn-ghost" onClick={()=>setShowExportModal(false)}>取消</button><button className="btn btn-primary" onClick={expMode==='nvenc' ? doExportNvenc : doExport}>开始导出</button></div>
                                 <div className="export-tips mt-3 text-xs text-zinc-400">{expFormat==='mp4'?'':''}</div>
                             </div>
                         </div>}

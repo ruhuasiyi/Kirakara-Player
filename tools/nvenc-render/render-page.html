@@ -26,6 +26,7 @@
     bgImage: null,      // HTMLImageElement | null
     bgCanvas: null,     // 预缩放后的背景 canvas（避免每帧缩放原图）
     bgImageOpacity: 1,
+    video: null,        // HTMLVideoElement | null（视频背景）
     imageFormat: 'jpeg', // 'jpeg' | 'png'（jpeg 编码快得多，最终 HEVC 本就有损）
   };
 
@@ -51,6 +52,17 @@
       const img = new Image();
       img.src = opts.bgImageDataUrl;
       window.__state.bgImage = img;  // drawImage 会在 loaded 后生效；首帧前需等 load
+    }
+
+    // 视频背景（file:// URL，逐帧 seek 取帧）
+    window.__state.video = null;
+    if (opts.videoSrc) {
+      const v = document.createElement('video');
+      v.muted = true;
+      v.playsInline = true;
+      v.preload = 'auto';
+      v.src = opts.videoSrc;
+      window.__state.video = v;
     }
     return { lyricCount: window.__state.lyrics.length, hasDualRuby: !!window._hasDualRuby };
   };
@@ -90,19 +102,39 @@
 
   // 等待背景就绪
   window.__ready = function () {
+    const s = window.__state;
+    if (s.video) return s.video.readyState >= 2;  // 等视频可 seek/绘制
     return window.__buildBgCache();
   };
 
-  // 画一帧，返回 PNG data URL
-  window.__renderFrame = function (t) {
+  // 画一帧，返回 data URL。有视频背景时需 seek，故 async。
+  window.__renderFrame = async function (t) {
     const s = window.__state;
     const c = document.getElementById('c');
     const ctx = c.getContext('2d');
 
     ctx.clearRect(0, 0, s.w, s.h);
 
-    // ---- 背景（已预合成的缓存，每帧仅一次 drawImage） ----
-    if (s.bgCanvas) {
+    // ---- 背景 ----
+    if (s.video) {
+      // 视频背景：seek 到 t，letterbox 居中绘制（对齐 js/export/renderer.js 的视频帧逻辑）
+      const v = s.video;
+      if (Math.abs(v.currentTime - t) > 0.001) {
+        await new Promise((resolve) => {
+          const onSeeked = () => { v.removeEventListener('seeked', onSeeked); resolve(); };
+          const onError = () => { v.removeEventListener('error', onError); resolve(); };
+          v.addEventListener('seeked', onSeeked);
+          v.addEventListener('error', onError);
+          try { v.currentTime = t; } catch (e) { resolve(); }
+        });
+      }
+      const vw = v.videoWidth || s.w, vh = v.videoHeight || s.h;
+      const scale = Math.min(s.w / vw, s.h / vh);
+      const dw = vw * scale, dh = vh * scale;
+      ctx.fillStyle = '#000';
+      ctx.fillRect(0, 0, s.w, s.h);
+      ctx.drawImage(v, (s.w - dw) / 2, (s.h - dh) / 2, dw, dh);
+    } else if (s.bgCanvas) {
       ctx.drawImage(s.bgCanvas, 0, 0);
     } else {
       ctx.fillStyle = s.config.bgColor || '#000';

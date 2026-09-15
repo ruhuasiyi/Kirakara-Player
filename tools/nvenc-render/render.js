@@ -29,7 +29,8 @@ function parseArgs() {
   };
   return {
     krl: get('--krl'),
-    audio: get('--audio'),
+    audio: get('--audio', null),        // 可空（有 --video 时）
+    video: get('--video', null),        // 视频背景（可选）
     bg: get('--bg', null),
     out: get('--out', path.join(process.cwd(), 'out.mp4')),
     fps: Number(get('--fps', 30)),
@@ -44,12 +45,26 @@ function parseArgs() {
     preset: get('--preset', 'p5'),
     cq: Number(get('--cq', 20)),
     imageFormat: get('--image-format', 'jpeg'),   // jpeg（快）| png（无损）
+    jsonProgress: a.includes('--json-progress'),
     keepFrames: a.includes('--keep-frames'),
   };
 }
 
+// JSON 进度输出（--json-progress 时，stdout 输出可被 server 解析的 JSON 行）
+let JSON_PROGRESS = false;
+function emit(msg) {
+  if (JSON_PROGRESS) console.log(JSON.stringify(msg));
+}
+
+// 帧序列较大（1080p@60fps 250s 可超 6GB），/tmp 是 tmpfs 空间有限会 EDQUOT，写到磁盘缓存目录
+function framesBaseDir() {
+  const d = path.join(os.homedir(), '.cache', 'kirakara-nvenc');
+  fs.mkdirSync(d, { recursive: true });
+  return d;
+}
+
 function mkTmpDir() {
-  return fs.mkdtempSync(path.join(os.tmpdir(), 'krkr-frames-'));
+  return fs.mkdtempSync(path.join(framesBaseDir(), 'frames-'));
 }
 
 function runFfmpeg(args) {
@@ -80,41 +95,56 @@ function parseKrl(text) {
   return { config, lrcRaw: text.slice(end).trim() };
 }
 
+// 取媒体时长（秒），失败返回 null
+function probeDuration(file) {
+  if (!file) return null;
+  try {
+    const out = require('child_process').execSync(
+      `ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 ${JSON.stringify(file)}`,
+      { encoding: 'utf8' }
+    );
+    const d = parseFloat(out.trim());
+    return Number.isFinite(d) ? d : null;
+  } catch (e) { return null; }
+}
+
 async function main() {
   const opt = parseArgs();
-  for (const k of ['krl', 'audio']) {
-    if (!opt[k]) { console.error(`缺少参数 --${k}`); process.exit(1); }
-  }
+  JSON_PROGRESS = opt.jsonProgress;
+  if (!opt.krl) { console.error('缺少参数 --krl'); process.exit(1); }
+  if (!opt.audio && !opt.video) { console.error('缺少 --audio 或 --video'); process.exit(1); }
   if (!fs.existsSync(CHROMIUM)) { console.error(`找不到 chromium: ${CHROMIUM}（可用环境变量 CHROMIUM 指定）`); process.exit(1); }
 
   const krlText = fs.readFileSync(opt.krl, 'utf8');
   const { config: krlConfig, lrcRaw } = parseKrl(krlText);
   if (krlConfig) console.log(`[render] 已从 project.krl 加载配置（fontFamily=${krlConfig.fontFamily} colorAfter=${krlConfig.colorAfter} bgColor=${krlConfig.bgColor}）`);
 
-  // 音频时长决定默认渲染时长（未指定 --duration 时）
-  let audioDuration = null;
-  try {
-    const out = require('child_process').execSync(
-      `ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 ${JSON.stringify(opt.audio)}`,
-      { encoding: 'utf8' }
-    );
-    audioDuration = parseFloat(out.trim());
-  } catch (e) { /* 忽略，用 --duration */ }
+  // 渲染时长 = max(音频, 视频)（未指定 --duration 时）
+  const audioDuration = probeDuration(opt.audio);
+  const videoDuration = probeDuration(opt.video);
 
   const renderStart = opt.start;
-  const renderEnd = opt.duration ? renderStart + opt.duration : audioDuration || 60;
+  const renderEnd = opt.duration ? renderStart + opt.duration : (Math.max(audioDuration || 0, videoDuration || 0) || 60);
   const renderDur = renderEnd - renderStart;
   const totalFrames = Math.max(1, Math.ceil(renderDur * opt.fps));
   const frameExt = opt.imageFormat === 'png' ? 'png' : 'jpg';
   console.log(`[render] 渲染区间 ${renderStart}s → ${renderEnd}s（${renderDur}s，${totalFrames} 帧 @${opt.fps}fps）`);
 
-  // 背景图 data URL
+  // 背景图 data URL（sniff 文件头判断 PNG/JPEG，不依赖扩展名）
   let bgImageDataUrl = null;
   if (opt.bg && fs.existsSync(opt.bg)) {
-    const ext = path.extname(opt.bg).slice(1).toLowerCase();
-    const mime = ext === 'png' ? 'image/png' : 'image/jpeg';
-    bgImageDataUrl = `data:${mime};base64,${fs.readFileSync(opt.bg).toString('base64')}`;
+    const buf = fs.readFileSync(opt.bg);
+    const isPng = buf[0] === 0x89 && buf[1] === 0x50 && buf[2] === 0x4e && buf[3] === 0x47;
+    const mime = isPng ? 'image/png' : 'image/jpeg';
+    bgImageDataUrl = `data:${mime};base64,${buf.toString('base64')}`;
     console.log(`[render] 背景图: ${opt.bg}`);
+  }
+
+  // 视频背景 file:// URL
+  let videoSrc = null;
+  if (opt.video && fs.existsSync(opt.video)) {
+    videoSrc = 'file://' + path.resolve(opt.video);
+    console.log(`[render] 视频背景: ${opt.video}`);
   }
 
   // ---- 启动无头 Chromium ----
@@ -128,6 +158,10 @@ async function main() {
       '--font-render-hinting=none',
       '--force-color-profile=srgb',
       '--hide-scrollbars',
+      // 视频背景是 file:// 加载，drawImage 到 canvas 后会被标记 taint 导致 toDataURL 抛 SecurityError。
+      // 离线渲染场景无安全顾虑，禁用同源限制以允许导出画布。
+      '--allow-file-access-from-files',
+      '--disable-web-security',
     ],
     defaultViewport: { width: opt.width, height: opt.height, deviceScaleFactor: 1 },
   });
@@ -144,9 +178,9 @@ async function main() {
     if (opt.font) config.fontFamily = opt.font;
     if (opt.bgColor) config.bgColor = opt.bgColor;
 
-    const initInfo = await page.evaluate(({ lrcRaw, config, w, h, bgImageDataUrl, bgImageOpacity, imageFormat }) => {
-      return window.__init({ lrcRaw, config, w, h, bgImageDataUrl, bgImageOpacity, imageFormat });
-    }, { lrcRaw, config, w: opt.width, h: opt.height, bgImageDataUrl, bgImageOpacity: opt.bgImageOpacity, imageFormat: opt.imageFormat });
+    const initInfo = await page.evaluate(({ lrcRaw, config, w, h, bgImageDataUrl, bgImageOpacity, imageFormat, videoSrc }) => {
+      return window.__init({ lrcRaw, config, w, h, bgImageDataUrl, bgImageOpacity, imageFormat, videoSrc });
+    }, { lrcRaw, config, w: opt.width, h: opt.height, bgImageDataUrl, bgImageOpacity: opt.bgImageOpacity, imageFormat: opt.imageFormat, videoSrc });
     console.log(`[render] 解析歌词 ${initInfo.lyricCount} 行，双注音=${initInfo.hasDualRuby}`);
 
     // 等背景就绪（纯色立即，封面图等加载+合成）
@@ -161,7 +195,12 @@ async function main() {
       if ((i + 1) % (opt.fps * 5) === 0 || i === totalFrames - 1) {
         const el = (Date.now() - t0) / 1000;
         const fpsNow = (i + 1) / el;
-        console.log(`[render] ${i + 1}/${totalFrames} 帧  渲染速度 ${fpsNow.toFixed(1)} fps  剩~${((totalFrames - i - 1) / fpsNow).toFixed(0)}s`);
+        const eta = Math.max(0, Math.round((totalFrames - i - 1) / fpsNow));
+        if (opt.jsonProgress) {
+          emit({ type: 'progress', frame: i + 1, total: totalFrames, fps: Math.round(fpsNow * 10) / 10, eta });
+        } else {
+          console.log(`[render] ${i + 1}/${totalFrames} 帧  渲染速度 ${fpsNow.toFixed(1)} fps  剩~${eta}s`);
+        }
       }
     }
     await browser.close();
@@ -169,25 +208,30 @@ async function main() {
 
     // ---- FFmpeg NVENC 编码 + 音轨 ----
     console.log(`[encode] FFmpeg ${opt.codec} ...`);
-    const audioIn = ['-ss', String(renderStart)];
-    if (opt.duration) audioIn.push('-t', String(opt.duration));
     const ffArgs = [
       '-y',
       '-framerate', String(opt.fps),
       '-i', path.join(framesDir, `%06d.${frameExt}`),
-      ...audioIn, '-i', opt.audio,
-      '-map', '0:v:0', '-map', '1:a:0',
+    ];
+    if (opt.audio) {
+      const audioIn = ['-ss', String(renderStart)];
+      if (opt.duration) audioIn.push('-t', String(opt.duration));
+      ffArgs.push(...audioIn, '-i', opt.audio, '-map', '0:v:0', '-map', '1:a:0', '-c:a', 'aac', '-b:a', '192k');
+    } else {
+      ffArgs.push('-map', '0:v:0');
+    }
+    ffArgs.push(
       '-c:v', opt.codec,
       '-preset', opt.preset,
       '-cq', String(opt.cq),
       '-b:v', '0',
       '-pix_fmt', 'yuv420p',
-      '-c:a', 'aac', '-b:a', '192k',
       '-shortest',
       '-movflags', '+faststart',
       opt.out,
-    ];
+    );
     await runFfmpeg(ffArgs);
+    emit({ type: 'done', path: opt.out });
     console.log(`[done] 输出: ${opt.out}`);
   } finally {
     if (browser.isConnected()) { try { await browser.close(); } catch (_) {} }
@@ -196,4 +240,4 @@ async function main() {
   }
 }
 
-main().catch(e => { console.error(e); process.exit(1); });
+main().catch(e => { emit({ type: 'error', message: e.message || String(e) }); console.error(e); process.exit(1); });
